@@ -36,6 +36,38 @@ with col3:
     target_label = st.selectbox("Output language", options=list(LANG_OPTIONS.keys()))
     target_lang = LANG_OPTIONS[target_label]
 
+# ---------------- NEW: summarization mode selector ----------------
+st.sidebar.header("Summarization Settings")
+
+mode_label = st.sidebar.radio(
+    "Summarization mode",
+    options=[
+        "Extractive (Clustering + MMR)",
+        "Hybrid (Extractive → Abstractive)",
+        "Abstractive Only",
+    ],
+    index=0,
+)
+
+# map label to internal string used in main.py
+if mode_label.startswith("Extractive"):
+    summarization_mode = "extractive"
+elif mode_label.startswith("Hybrid"):
+    summarization_mode = "hybrid"
+else:
+    summarization_mode = "abstractive"
+
+# optional: lambda slider for MMR
+lambda_param = st.sidebar.slider(
+    "MMR λ (relevance vs diversity)",
+    min_value=0.1,
+    max_value=0.9,
+    value=0.7,
+    step=0.1,
+    help="Higher = more relevance, lower = more diversity between sentences.",
+)
+
+# -----------------------------------------------------------------
 
 if uploaded:
     if not os.path.exists("data"):
@@ -54,7 +86,9 @@ if uploaded:
                 path,
                 target_lang=target_lang,
                 prefer_sbert=prefer_sbert,
-                do_ocr=do_ocr
+                do_ocr=do_ocr,
+                summarization_mode=summarization_mode,   # NEW
+                lambda_param=lambda_param,               # NEW
             )
         except Exception as e:
             st.error(f"Processing failed: {e}")
@@ -70,10 +104,14 @@ if uploaded:
 
     st.subheader("📂 Per-section Details")
     for sec in out["sections"]:
-        st.markdown(f"**{sec['heading']}** — Detected Language: `{sec['src_lang']}`")
-        st.write("**Extractive Summary:**")
+        st.markdown(
+            f"**{sec['heading']}** — "
+            f"Detected Language: `{sec['src_lang']}` — "
+            f"Clustering Used: `{sec.get('clustering', 'unknown')}`"
+        )
+        st.write("**Extractive / Base Summary:**")
         st.write(sec["extractive"])
-        st.write("**Translated:**")
+        st.write(f"**Rewritten / Translated Summary ({target_lang}):**")
         st.write(sec["rewritten"])
         st.write("**Sentiment:**")
         st.write(sec["sentiment"])

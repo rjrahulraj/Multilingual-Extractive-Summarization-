@@ -284,11 +284,16 @@
 
 """
 main.py
-- Extractive summarization + multilingual rewriting + sentiment
-- Q&A over the full document using FAISS RAG
+- Extractive summarization (clustering + MMR)
+- Hybrid (extractive → abstractive)
+- Optional fully abstractive summarization
+- Translation / rewriting
+- Sentiment scoring
+- RAG QA using FAISS
 """
 
 from typing import Dict, Any
+import re
 
 # Summarizer modules
 from gensumm.gensumm_extractive import (
@@ -300,11 +305,18 @@ from gensumm.gensumm_extractive import (
     extractive_summary,
 )
 
+# Abstractive module
+try:
+    from gensumm.abstractive import generate_abstractive_summary
+    _HAS_ABS = True
+except Exception:
+    _HAS_ABS = False
+
 # Translation + sentiment
 from gensumm.translator import rewrite_text
 from gensumm.sentiment_module import analyze_sentiment
 
-# FAISS RAG module
+# RAG QA utilities
 from gensumm.qa_module import (
     build_context_embeddings,
     retrieve_relevant,
@@ -312,122 +324,183 @@ from gensumm.qa_module import (
 )
 
 
+# ============================================================
+#                  DOCUMENT SUMMARIZATION MAIN
+# ============================================================
+
 def summarize_document_main(
     file_path: str,
     target_lang: str = "en",
     prefer_sbert: bool = True,
     do_ocr: bool = False,
-    compression_ratio: float = 0.20,  
-    max_cap: int = 40,               
-    min_sentences: int = 3,           
+    compression_ratio: float = 0.20,
+    max_cap: int = 40,
+    min_sentences: int = 3,
+    summarization_mode: str = "extractive",     # extractive | hybrid | abstractive
+    lambda_param: float = 0.7,
+    abs_model_name: str = "facebook/bart-large-cnn",
 ) -> Dict[str, Any]:
- 
-    full_text = extract_text(file_path, do_ocr=do_ocr)
 
+    full_text = extract_text(file_path, do_ocr=do_ocr)
     sections = detect_sections(file_path, full_text)
 
     out_sections = []
-    all_sent_scores = {"neg": 0.0, "neu": 0.0, "pos": 0.0}
-    count = 0
-  
+    sentiment_acc = {"neg": 0.0, "neu": 0.0, "pos": 0.0}
+    sentiment_count = 0
+
     for head, content in sections:
         sents = split_sentences(content)
-
         if not sents:
             continue
 
         n = len(sents)
-
-
         target = int(round(n * compression_ratio))
-        max_sent = max(min_sentences, min(max_cap, target))
-        max_sent = min(max_sent, n)  
+
+        base_max_sent = max(min_sentences, min(max_cap, target))
+        base_max_sent = min(base_max_sent, n)
+
+        # Hybrid receives *more extractive content*
+        if summarization_mode == "hybrid":
+            local_max_sent = min(n, int(base_max_sent * 2.5))
+        else:
+            local_max_sent = base_max_sent
 
         embs = embed_sentences(sents, prefer_sbert=prefer_sbert)
-        extractive = extractive_summary(
-            sents,
-            embs,
-            max_sent=max_sent,
-        )
-  
+
+        # --------------------------------------------------------
+        #               SELECT SUMMARIZATION MODE
+        # --------------------------------------------------------
+        raw_extractive = None
+        used_cluster = "none"
+
+        if summarization_mode == "extractive":
+            raw_extractive, used_cluster = extractive_summary(
+                sents, embs, max_sent=local_max_sent, lambda_param=lambda_param
+            )
+            final_summary = raw_extractive
+
+        elif summarization_mode == "hybrid":
+            # STEP 1: Extractive → get much larger chunk
+            raw_extractive, used_cluster = extractive_summary(
+                sents, embs, max_sent=local_max_sent, lambda_param=lambda_param
+            )
+
+            # clean extractive text before abstractive
+            cleaned_extract = re.sub(r"\s+", " ", raw_extractive).strip()
+
+            # STEP 2: Abstractive processing
+            if _HAS_ABS:
+                final_summary = generate_abstractive_summary(
+                    cleaned_extract,
+                    model_name=abs_model_name,
+                    max_summary_tokens=256,  # longer for hybrid
+                    min_summary_tokens=96,
+                )
+            else:
+                final_summary = cleaned_extract + \
+                    "\n\n(Note: Abstractive model not installed.)"
+
+        elif summarization_mode == "abstractive":
+            raw_extractive = None
+            if _HAS_ABS:
+                final_summary = generate_abstractive_summary(
+                    content,
+                    model_name=abs_model_name,
+                    max_summary_tokens=256,
+                    min_summary_tokens=64,
+                )
+                used_cluster = "abstractive-only"
+            else:
+                final_summary = "(Error: Abstractive model not installed.)"
+
+        else:
+            raise ValueError("Invalid mode: choose extractive | hybrid | abstractive")
+
+        # --------------------------------------------------------
+        #          LANGUAGE DETECTION → TRANSLATION
+        # --------------------------------------------------------
         try:
-            src_lang = detect_language(extractive)
+            src_lang = detect_language(final_summary)
         except Exception:
             src_lang = "unknown"
 
-  
         task = "summarize" if src_lang == target_lang else "translate"
-        rewritten = rewrite_text(
-            extractive,
-            src_lang=src_lang,
-            tgt_lang=target_lang,
-            task=task,
-        )
-  
-        sent = analyze_sentiment(extractive)
-        if sent:
-            for k in all_sent_scores:
-                all_sent_scores[k] += sent.get(k, 0.0)
-            count += 1
 
-        out_sections.append(
-            {
-                "heading": head,
-                "src_lang": src_lang,
-                "extractive": extractive,
-                "rewritten": rewritten,
-                "sentiment": sent,
-            }
+        rewritten = rewrite_text(
+            final_summary, src_lang=src_lang, tgt_lang=target_lang, task=task
         )
- 
+
+        # --------------------------------------------------------
+        #                 SENTIMENT ANALYSIS
+        # --------------------------------------------------------
+        sent = analyze_sentiment(final_summary)
+        if sent:
+            for k in sentiment_acc:
+                sentiment_acc[k] += sent.get(k, 0.0)
+            sentiment_count += 1
+
+        out_sections.append({
+            "heading": head,
+            "src_lang": src_lang,
+            "final_summary": final_summary,
+            "rewritten": rewritten,
+            "sentiment": sent,
+            "clustering": used_cluster,
+            "mode": summarization_mode,
+            "raw_extractive": raw_extractive,
+        })
+
+    # ------------------------------------------------------------
+    #                   AGGREGATE SENTIMENT
+    # ------------------------------------------------------------
+
     overall_sentiment = {
-        k: (all_sent_scores[k] / count if count else None) for k in all_sent_scores
+        k: (sentiment_acc[k] / sentiment_count if sentiment_count else None)
+        for k in sentiment_acc
     }
 
-    md = "\n".join(
-        f"### {s['heading']}\n{s['rewritten']}\n" for s in out_sections
-    ).strip()
+    # ------------------------------------------------------------
+    #                     MARKDOWN OUTPUT
+    # ------------------------------------------------------------
+    md = ""
+    for s in out_sections:
+        md += (
+            f"### {s['heading']}\n"
+            f"**Summary ({s['mode']}):**\n{s['final_summary']}\n\n"
+            f"**Rewritten / Translated ({target_lang}):**\n{s['rewritten']}\n\n"
+            f"**Clustering Used:** `{s['clustering']}`\n"
+            "---\n\n"
+        )
 
     return {
-        "summary": md,
+        "summary": md.strip(),
         "sections": out_sections,
         "overall_sentiment": overall_sentiment,
     }
 
-  
 
-def answer_question_main(
-    file_path: str,
-    question: str,
-    do_ocr: bool = False,
-) -> Dict[str, Any]:
-    """
-    Simple RAG-style QA over the full document.
-    """
+# ============================================================
+#                           RAG QA MAIN
+# ============================================================
+
+def answer_question_main(file_path: str, question: str, do_ocr: bool = False) -> Dict[str, Any]:
 
     if not question.strip():
         return {"answer": "Please enter a valid question."}
 
     full_text = extract_text(file_path, do_ocr=do_ocr)
-
     sentences = split_sentences(full_text)
 
     if not sentences:
         return {
             "question": question,
-            "answer": "No readable text found in the document.",
+            "answer": "No readable text found.",
             "context": "",
         }
 
     embeddings = build_context_embeddings(sentences)
-
     context = retrieve_relevant(sentences, embeddings, question, top_k=3)
-
     answer = answer_question_generative(question, context)
 
-    return {
-        "question": question,
-        "context": context,
-        "answer": answer,
-    }
+    return {"question": question, "context": context, "answer": answer}
 
