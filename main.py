@@ -284,39 +284,42 @@
 
 """
 main.py
-- Extractive summarization (clustering + MMR)
-- Hybrid (extractive → abstractive)
-- Optional fully abstractive summarization
-- Translation / rewriting
-- Sentiment scoring
-- RAG QA using FAISS
+Updated to use new modular extractive + abstractive summarizers.
 """
 
 from typing import Dict, Any
 import re
 
-# Summarizer modules
+# ------------------------------------------------------------
+#  EXTRACTIVE SUMMARIZER (new modular version)
+# ------------------------------------------------------------
+from extractive.ex_summarizer import extractive_summary
+
+# Utilities (unchanged)
 from gensumm.gensumm_extractive import (
     extract_text,
     detect_sections,
     detect_language,
     embed_sentences,
     split_sentences,
-    extractive_summary,
 )
 
-# Abstractive module
+# ------------------------------------------------------------
+#  ABSTRACTIVE SUMMARIZER (new modular version)
+# ------------------------------------------------------------
 try:
-    from gensumm.abstractive import generate_abstractive_summary
+    from abstractive.abs_summarizer import AbstractiveSummarizer
+    ABS_MODEL = None   # lazy load when needed
     _HAS_ABS = True
 except Exception:
+    ABS_MODEL = None
     _HAS_ABS = False
 
-# Translation + sentiment
+# Translation + sentiment modules (unchanged)
 from gensumm.translator import rewrite_text
 from gensumm.sentiment_module import analyze_sentiment
 
-# RAG QA utilities
+# RAG QA modules (unchanged)
 from gensumm.qa_module import (
     build_context_embeddings,
     retrieve_relevant,
@@ -324,9 +327,9 @@ from gensumm.qa_module import (
 )
 
 
-# ============================================================
-#                  DOCUMENT SUMMARIZATION MAIN
-# ============================================================
+# ===================================================================
+#                       DOCUMENT SUMMARIZATION MAIN
+# ===================================================================
 
 def summarize_document_main(
     file_path: str,
@@ -336,10 +339,17 @@ def summarize_document_main(
     compression_ratio: float = 0.20,
     max_cap: int = 40,
     min_sentences: int = 3,
-    summarization_mode: str = "extractive",     # extractive | hybrid | abstractive
+    summarization_mode: str = "extractive",  # extractive | hybrid | abstractive
     lambda_param: float = 0.7,
-    abs_model_name: str = "facebook/bart-large-cnn",
+    abs_model_name: str = "google/flan-t5-base",
 ) -> Dict[str, Any]:
+
+    global ABS_MODEL
+
+    # Load abstractive model on first use
+    if summarization_mode in ["hybrid", "abstractive"] and _HAS_ABS:
+        if ABS_MODEL is None or ABS_MODEL.model_name != abs_model_name:
+            ABS_MODEL = AbstractiveSummarizer(abs_model_name)
 
     full_text = extract_text(file_path, do_ocr=do_ocr)
     sections = detect_sections(file_path, full_text)
@@ -359,7 +369,7 @@ def summarize_document_main(
         base_max_sent = max(min_sentences, min(max_cap, target))
         base_max_sent = min(base_max_sent, n)
 
-        # Hybrid receives *more extractive content*
+        # Hybrid needs a larger extractive "pre-summary"
         if summarization_mode == "hybrid":
             local_max_sent = min(n, int(base_max_sent * 2.5))
         else:
@@ -368,7 +378,7 @@ def summarize_document_main(
         embs = embed_sentences(sents, prefer_sbert=prefer_sbert)
 
         # --------------------------------------------------------
-        #               SELECT SUMMARIZATION MODE
+        #          SELECT SUMMARIZATION MODE
         # --------------------------------------------------------
         raw_extractive = None
         used_cluster = "none"
@@ -380,21 +390,19 @@ def summarize_document_main(
             final_summary = raw_extractive
 
         elif summarization_mode == "hybrid":
-            # STEP 1: Extractive → get much larger chunk
+            # Step 1: extractive
             raw_extractive, used_cluster = extractive_summary(
                 sents, embs, max_sent=local_max_sent, lambda_param=lambda_param
             )
-
-            # clean extractive text before abstractive
             cleaned_extract = re.sub(r"\s+", " ", raw_extractive).strip()
 
-            # STEP 2: Abstractive processing
+            # Step 2: abstractive
             if _HAS_ABS:
-                final_summary = generate_abstractive_summary(
+                final_summary = ABS_MODEL.summarize(
                     cleaned_extract,
-                    model_name=abs_model_name,
-                    max_summary_tokens=256,  # longer for hybrid
-                    min_summary_tokens=96,
+                    max_len=256,
+                    min_len=96,
+                    temperature=0.7,
                 )
             else:
                 final_summary = cleaned_extract + \
@@ -402,22 +410,22 @@ def summarize_document_main(
 
         elif summarization_mode == "abstractive":
             raw_extractive = None
+
             if _HAS_ABS:
-                final_summary = generate_abstractive_summary(
+                final_summary = ABS_MODEL.summarize(
                     content,
-                    model_name=abs_model_name,
-                    max_summary_tokens=256,
-                    min_summary_tokens=64,
+                    max_len=256,
+                    min_len=64,
                 )
                 used_cluster = "abstractive-only"
             else:
                 final_summary = "(Error: Abstractive model not installed.)"
 
         else:
-            raise ValueError("Invalid mode: choose extractive | hybrid | abstractive")
+            raise ValueError("Mode must be: extractive | hybrid | abstractive")
 
         # --------------------------------------------------------
-        #          LANGUAGE DETECTION → TRANSLATION
+        #                  LANGUAGE DETECTION + TRANSLATION
         # --------------------------------------------------------
         try:
             src_lang = detect_language(final_summary)
@@ -427,7 +435,10 @@ def summarize_document_main(
         task = "summarize" if src_lang == target_lang else "translate"
 
         rewritten = rewrite_text(
-            final_summary, src_lang=src_lang, tgt_lang=target_lang, task=task
+            final_summary,
+            src_lang=src_lang,
+            tgt_lang=target_lang,
+            task=task,
         )
 
         # --------------------------------------------------------
@@ -444,30 +455,29 @@ def summarize_document_main(
             "src_lang": src_lang,
             "final_summary": final_summary,
             "rewritten": rewritten,
-            "sentiment": sent,
-            "clustering": used_cluster,
-            "mode": summarization_mode,
             "raw_extractive": raw_extractive,
+            "clustering": used_cluster,
+            "sentiment": sent,
+            "mode": summarization_mode,
         })
 
-    # ------------------------------------------------------------
-    #                   AGGREGATE SENTIMENT
-    # ------------------------------------------------------------
-
+    # -------------------------------
+    # Aggregate sentiment
+    # -------------------------------
     overall_sentiment = {
         k: (sentiment_acc[k] / sentiment_count if sentiment_count else None)
         for k in sentiment_acc
     }
 
-    # ------------------------------------------------------------
-    #                     MARKDOWN OUTPUT
-    # ------------------------------------------------------------
+    # -------------------------------
+    # Markdown Output
+    # -------------------------------
     md = ""
     for s in out_sections:
         md += (
             f"### {s['heading']}\n"
             f"**Summary ({s['mode']}):**\n{s['final_summary']}\n\n"
-            f"**Rewritten / Translated ({target_lang}):**\n{s['rewritten']}\n\n"
+            f"**Rewritten ({target_lang}):**\n{s['rewritten']}\n\n"
             f"**Clustering Used:** `{s['clustering']}`\n"
             "---\n\n"
         )
@@ -479,9 +489,9 @@ def summarize_document_main(
     }
 
 
-# ============================================================
-#                           RAG QA MAIN
-# ============================================================
+# ===================================================================
+#                             RAG QA MAIN
+# ===================================================================
 
 def answer_question_main(file_path: str, question: str, do_ocr: bool = False) -> Dict[str, Any]:
 
@@ -503,4 +513,3 @@ def answer_question_main(file_path: str, question: str, do_ocr: bool = False) ->
     answer = answer_question_generative(question, context)
 
     return {"question": question, "context": context, "answer": answer}
-
